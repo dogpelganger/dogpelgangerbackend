@@ -1,0 +1,6 @@
+flask
+flask-cors
+gunicorn
+numpy==1.26.4
+pillow
+faiss-cpu==1.8.0.post1
