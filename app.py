@@ -1,142 +1,94 @@
+cat > app.py <<'PY'
 import os
-from typing import List, Optional, Tuple
-
 import numpy as np
-import faiss
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-APP_TITLE = "Dogpelgänger Backend (FAISS-only)"
+import faiss  # faiss-cpu
 
-# Example: https://pub-xxxx.r2.dev
-R2_BASE_URL = os.environ.get(
-    "R2_BASE_URL",
-    "https://pub-4b9f9bd46442471da196ba4ed4966ab0.r2.dev"
-).rstrip("/")
-
-# If your R2 objects are stored under a subfolder, set this.
-# Examples:
-#   ""              -> https://...r2.dev/dog123.jpg
-#   "dogs/"         -> https://...r2.dev/dogs/dog123.jpg
-#   "assets/dogs/"  -> https://...r2.dev/assets/dogs/dog123.jpg
-DOG_IMAGE_PREFIX = os.environ.get("DOG_IMAGE_PREFIX", "").lstrip("/")
-
-EMBEDDINGS_PATH = os.environ.get("EMBEDDINGS_PATH", "embeddings_dogs.npz")
-DEFAULT_TOPK = int(os.environ.get("TOPK", "6"))
+APP_NAME = "Dogpelgänger Backend (FAISS-only)"
+R2_BASE = os.environ.get("R2_BASE", "https://pub-4b9f9bd46442471da196ba4ed4966ab0.r2.dev")
+EMB_PATH = os.environ.get("DOG_EMBEDDINGS_NPZ", "embeddings_dogs.npz")
+EXPECTED_DIM = int(os.environ.get("EXPECTED_DIM", "1280"))
 
 app = Flask(__name__)
 CORS(app)
 
-index: Optional[faiss.Index] = None
-dog_filenames: List[str] = []
-dog_matrix: Optional[np.ndarray] = None
+_index = None
+_dog_embeddings = None
+_dog_filenames = None
 
+def load_index():
+    global _index, _dog_embeddings, _dog_filenames
 
-def _load_embeddings() -> Tuple[np.ndarray, List[str]]:
-    if not os.path.exists(EMBEDDINGS_PATH):
-        raise FileNotFoundError(
-            f"Missing {EMBEDDINGS_PATH}. Put it in the repo root or set EMBEDDINGS_PATH."
-        )
+    if not os.path.exists(EMB_PATH):
+        raise FileNotFoundError(f"Missing {EMB_PATH}. Upload a 1280-d embeddings_dogs.npz.")
 
-    d = np.load(EMBEDDINGS_PATH, allow_pickle=True)
+    d = np.load(EMB_PATH, allow_pickle=True)
+    if "embeddings" not in d.files or "filenames" not in d.files:
+        raise ValueError(f"{EMB_PATH} must contain 'embeddings' and 'filenames'. Found: {d.files}")
 
-    emb = d["embeddings"].astype(np.float32)          # (N, D)
-    names = [str(x) for x in d["filenames"].tolist()] # (N,)
+    emb = d["embeddings"].astype("float32")
+    names = d["filenames"]
 
     if emb.ndim != 2:
-        raise ValueError(f"'embeddings' must be 2D (N,D). Got shape {emb.shape}")
-    if len(names) != emb.shape[0]:
-        raise ValueError(f"filenames length {len(names)} != embeddings rows {emb.shape[0]}")
+        raise ValueError(f"embeddings must be 2D. Got shape {emb.shape}")
 
-    return emb, names
+    n, dim = emb.shape
+    if dim != EXPECTED_DIM:
+        raise ValueError(f"Embedding dim {dim} != expected {EXPECTED_DIM}")
 
-
-def _build_faiss_index(emb: np.ndarray) -> faiss.Index:
-    # cosine similarity = inner product after L2 normalization
+    # cosine similarity via inner product on normalized vectors
     faiss.normalize_L2(emb)
-    d = emb.shape[1]
-    idx = faiss.IndexFlatIP(d)
-    idx.add(emb)
-    return idx
+    index = faiss.IndexFlatIP(dim)
+    index.add(emb)
 
+    _index = index
+    _dog_embeddings = emb
+    _dog_filenames = names
 
-def _ensure_loaded():
-    global index, dog_filenames, dog_matrix
-    if index is not None:
-        return
-
-    emb, names = _load_embeddings()
-    dog_matrix = emb
-    dog_filenames = names
-    index = _build_faiss_index(dog_matrix)
-
-    print(f"[startup] Loaded {len(dog_filenames)} dogs. dim={dog_matrix.shape[1]}", flush=True)
-
-
-def _dog_url(fname: str) -> str:
-    if DOG_IMAGE_PREFIX:
-        return f"{R2_BASE_URL}/{DOG_IMAGE_PREFIX.rstrip('/')}/{fname}"
-    return f"{R2_BASE_URL}/{fname}"
-
+load_index()
 
 @app.get("/")
-def home():
-    return jsonify({"ok": True, "service": APP_TITLE})
-
+def root():
+    return jsonify({"ok": True, "service": APP_NAME})
 
 @app.get("/health")
 def health():
-    try:
-        _ensure_loaded()
-        dim = int(dog_matrix.shape[1]) if dog_matrix is not None else None
-        return jsonify({"ok": True, "dogs": len(dog_filenames), "dim": dim})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
+    return jsonify({
+        "ok": True,
+        "service": APP_NAME,
+        "dogs": int(_dog_embeddings.shape[0]),
+        "dim": int(_dog_embeddings.shape[1]),
+        "r2_base": R2_BASE
+    })
 
 @app.post("/match")
 def match():
-    """
-    JSON body:
-      { "embedding": [float,...], "top_k": 6 }
+    payload = request.get_json(force=True, silent=True) or {}
+    emb = payload.get("embedding")
+    top_k = int(payload.get("top_k", 6))
 
-    Returns:
-      { "top_matches": [ {dog_image, score, dog_url}, ... ] }
-    """
-    _ensure_loaded()
+    if emb is None:
+        return jsonify({"error": "Missing 'embedding' in JSON body"}), 400
 
-    payload = request.get_json(silent=True) or {}
-    emb_list = payload.get("embedding")
-    if not isinstance(emb_list, list) or len(emb_list) == 0:
-        return jsonify({"error": "Missing 'embedding' (list of floats)."}), 400
+    vec = np.array(emb, dtype="float32").reshape(1, -1)
+    if vec.shape[1] != EXPECTED_DIM:
+        return jsonify({"error": f"Embedding dim {vec.shape[1]} != expected {EXPECTED_DIM}"}), 400
 
-    try:
-        q = np.array(emb_list, dtype=np.float32).reshape(1, -1)
-    except Exception:
-        return jsonify({"error": "Invalid embedding format."}), 400
+    faiss.normalize_L2(vec)
+    scores, idx = _index.search(vec, top_k)
 
-    if dog_matrix is None:
-        return jsonify({"error": "Embeddings not loaded."}), 500
-
-    if q.shape[1] != dog_matrix.shape[1]:
-        return jsonify({"error": f"Embedding dim {q.shape[1]} != expected {dog_matrix.shape[1]}"}), 400
-
-    faiss.normalize_L2(q)
-
-    top_k = int(payload.get("top_k", DEFAULT_TOPK))
-    top_k = max(1, min(top_k, 50))
-
-    scores, idxs = index.search(q, top_k)
-
-    out = []
-    for score, i in zip(scores[0].tolist(), idxs[0].tolist()):
+    top_matches = []
+    for i, s in zip(idx[0].tolist(), scores[0].tolist()):
         if i < 0:
             continue
-        fname = dog_filenames[i]
-        out.append({
+        fname = str(_dog_filenames[i])
+        top_matches.append({
             "dog_image": fname,
-            "score": float(score),
-            "dog_url": _dog_url(fname),
+            "dog_url": f"{R2_BASE}/{fname}",
+            "score": float(s)
         })
 
-    return jsonify({"top_matches": out})
+    return jsonify({"ok": True, "top_matches": top_matches})
+PY

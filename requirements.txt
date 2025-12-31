@@ -1,6 +1,8 @@
+cat > requirements.txt <<'REQ'
 flask
 flask-cors
 gunicorn
-numpy==1.26.4
+numpy
 pillow
-faiss-cpu==1.8.0.post1
+faiss-cpu
+REQ
