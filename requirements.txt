@@ -1,8 +1,6 @@
-cat > requirements.txt <<'REQ'
 flask
 flask-cors
 gunicorn
 numpy
 pillow
 faiss-cpu
-REQ
